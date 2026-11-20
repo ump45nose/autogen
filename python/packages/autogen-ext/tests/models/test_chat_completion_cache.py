@@ -1079,3 +1079,54 @@ async def test_create_stream_with_cached_non_streaming_result_non_string_content
     assert stream_results[0].content == [expected_function_call]
     assert stream_results[0].finish_reason == "function_calls"
     assert stream_results[0].cached is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed_stream", [False, True], ids=["create-seed", "stream-seed"])
+@pytest.mark.parametrize("hit_stream", [False, True], ids=["create-hit", "stream-hit"])
+async def test_cache_isolation_across_call_modes(seed_stream: bool, hit_stream: bool) -> None:
+    """Mutating misses and hits must preserve nested cache data in either call mode."""
+    messages: List[LLMMessage] = [UserMessage(content="hello", source="user")]
+    replay_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                content=[FunctionCall(id="call_1", name="get_weather", arguments='{"city": "Paris"}')],
+                finish_reason="function_calls",
+                usage=RequestUsage(prompt_tokens=5, completion_tokens=7),
+                cached=False,
+            )
+        ]
+    )
+    replay_client.set_cached_bool_value(False)
+    cached_client = ChatCompletionCache(replay_client)
+
+    async def read_result(stream: bool) -> CreateResult:
+        if not stream:
+            return await cached_client.create(messages)
+        results = [chunk async for chunk in cached_client.create_stream(messages) if isinstance(chunk, CreateResult)]
+        assert len(results) == 1
+        return results[0]
+
+    original = await read_result(seed_stream)
+    initial_usage = copy.copy(replay_client.actual_usage())
+    assert not original.cached
+    assert isinstance(original.content, list)
+    original.content[0].arguments = '{"city": "Berlin"}'
+    original.usage.prompt_tokens = 999
+
+    hit = await read_result(hit_stream)
+    assert hit.cached
+    assert isinstance(hit.content, list)
+    assert hit.content[0].arguments == '{"city": "Paris"}'
+    assert hit.usage.prompt_tokens == 5
+    hit.content[0].arguments = '{"city": "London"}'
+    hit.usage.prompt_tokens = 888
+
+    for stream in (False, True):
+        subsequent = await read_result(stream)
+        assert subsequent.cached
+        assert isinstance(subsequent.content, list)
+        assert subsequent.content[0].arguments == '{"city": "Paris"}'
+        assert subsequent.usage.prompt_tokens == 5
+    assert not original.cached
+    assert replay_client.actual_usage() == initial_usage
